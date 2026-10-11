@@ -6,6 +6,9 @@ import SwiftUI
 @Observable
 final class ScreenLifecycle<Model: ScreenViewModel> {
     private(set) var model: Model?
+    private(set) var startupError: (any Error)?
+    private(set) var startupAttempt = 0
+    @ObservationIgnored private var startupCompleted = false
     @ObservationIgnored private var isRunning = false
     @ObservationIgnored private var isFocused = false
     @ObservationIgnored private var hasGainedFocus = false
@@ -14,6 +17,12 @@ final class ScreenLifecycle<Model: ScreenViewModel> {
 
     func updatePhase(_ phase: ScenePhase) {
         phaseContinuation?.yield(phase)
+    }
+
+    func retryStartup() {
+        guard startupError != nil, !isRunning else { return }
+        startupError = nil
+        startupAttempt += 1
     }
 
     func run(phase: ScenePhase, configure: @MainActor (Model) -> Void) async {
@@ -29,7 +38,7 @@ final class ScreenLifecycle<Model: ScreenViewModel> {
         }
         guard !Task.isCancelled else { return }
         isRunning = true
-        let isFirstTask = model == nil
+        let isReturningAfterStartup = startupCompleted
         let currentModel: Model
         if let model {
             currentModel = model
@@ -52,8 +61,16 @@ final class ScreenLifecycle<Model: ScreenViewModel> {
             runWaiters.removeAll()
         }
 
-        if isFirstTask {
-            await currentModel.onStartup()
+        if !startupCompleted {
+            startupError = nil
+            do {
+                try await currentModel.onStartup()
+                try Task.checkCancellation()
+                startupCompleted = true
+            } catch {
+                if !Task.isCancelled { startupError = error }
+                return
+            }
         }
         guard !Task.isCancelled else { return }
 
@@ -64,10 +81,9 @@ final class ScreenLifecycle<Model: ScreenViewModel> {
             group.addTask {
                 await self.observeFocus(phaseStream, model: currentModel)
             }
-            if isFirstTask {
-                await currentModel.runSubscribers()
-            } else {
-                await currentModel.onReturn()
+            if isReturningAfterStartup { await currentModel.onReturn() }
+            if !Task.isCancelled {
+                await currentModel.subscriptions().run()
                 await suspendUntilCancelled()
             }
             phases.continuation.finish()

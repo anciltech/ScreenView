@@ -36,7 +36,6 @@ final class AccountViewModel: ScreenViewModel {
 
     func onReturn() async {
         status = "Returned"
-        await runSubscribers()
     }
 
     func teardown() { status = "Stopped" }

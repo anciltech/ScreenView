@@ -21,7 +21,7 @@ or add the package and product to your manifest:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/anciltech/ScreenView.git", from: "0.1.0")
+    .package(url: "https://github.com/anciltech/ScreenView.git", branch: "main")
 ],
 targets: [
     .target(name: "YourApp", dependencies: ["ScreenView"])
@@ -50,7 +50,7 @@ final class AccountViewModel: ScreenViewModel {
     var name = ""
     init() {}
 
-    func onStartup() async {
+    func onStartup() async throws {
         // Perform finite, cancellation-aware setup here.
     }
 }
@@ -78,6 +78,41 @@ Screen<DocumentUploadView, DocumentUploadViewModel>(
 Configuration runs once, before `onStartup()`. Give a different route input a
 different SwiftUI identity when it needs a new model. Updating the configure
 closure on an existing screen does not reconfigure its retained model.
+
+## Startup recovery
+
+`onStartup()` can throw. Startup is complete only when the hook returns
+successfully and the screen task has not been cancelled. After interrupted
+startup, the next task retries on the same model without repeating configuration.
+After startup completes, subsequent tasks use `onReturn()` instead.
+
+A thrown failure ends the task, calls teardown, and displays a failure message
+with a **Retry** button. Retry starts a new SwiftUI task using the retained model.
+Focus hooks and subscriptions do not start until startup succeeds. Cancellation
+does not display a failure message or start an automatic retry loop.
+
+Startup must tolerate retries after partial work, and the model must remain
+usable after teardown. Throw failures that should trigger the failure/retry UI;
+catching an error and returning normally reports successful startup.
+
+[`Examples/StartupRecoveryExample.swift`](Examples/StartupRecoveryExample.swift)
+shows the resource distinction using a URL session acquired before an async
+download. If startup is cancelled, teardown invalidates the session and clears
+its reference. The next task retries startup on the retained model with a fresh
+session; it does not call `onReturn()` with partially initialized data. A thrown
+download failure follows the same cleanup path and exposes the Retry button.
+
+Once startup succeeds, downloaded data stays on the model. Teardown still
+releases the session, so `onReturn()` reacquires that task-scoped resource without
+repeating initial loading. Startup completion is not reset by teardown. If a
+resource is only needed for startup, it need not be reopened on return; resources
+used by subscriptions can instead be acquired and released within those
+subscription tasks.
+
+Retries are not transactional: ScreenView cannot undo partial writes or external
+side effects. Keep setup repeatable or track completed steps in the model, and
+make teardown safe after incomplete setup. Recovery from interrupted startup
+belongs in `onStartup()`, not in `onReturn()`.
 
 ## Subscriptions
 
@@ -120,16 +155,20 @@ or another actor. Do not spawn detached tasks to implement a subscriber.
 
 | Hook | When it runs |
 | --- | --- |
-| `onStartup()` | Once per model, after configuration. |
+| `onStartup()` | After configuration, retried until one attempt succeeds without cancellation. |
 | `onFirstFocus()` | The first observed active app scene after startup. |
 | `onLostFocus()` | A previously active scene becomes inactive/background. |
 | `onRegainedFocus()` | The scene becomes active again; defaults to `onFirstFocus()`. |
-| `onReturn()` | SwiftUI starts another task for a retained model; defaults to restarting subscriptions. |
+| `onReturn()` | SwiftUI starts another task for a retained model whose startup completed; defaults to no work. |
 | `teardown()` | Synchronously when every screen task exits, after structured children finish. |
 
-When overriding `onReturn()`, perform finite return-specific work, then call
-`await runSubscribers()` to restart live updates. An override that only returns
-leaves the screen alive without restarting its subscribers.
+When overriding `onReturn()`, perform finite return-specific work and return.
+The runner starts subscriptions after startup or `onReturn()` completes. An
+override never needs to call `runSubscribers()` to preserve live updates.
+
+Remove `await runSubscribers()` from existing `onReturn()` implementations;
+that method suspends until cancellation and would prevent the runner from
+reaching its subscription step.
 
 Scene hooks are serialized in a structured child task after startup. They
 describe **scene activation**, not route visibility. Scene transitions observed
@@ -156,15 +195,18 @@ plain `@State`; for child content, pass a model owned by the parent. An optional
 [`Examples/AccountExample.swift`](Examples/AccountExample.swift) is complete
 content you can use from an app's `WindowGroup`. It includes a source actor,
 observable model, bindings, and native navigation.
+[`Examples/StartupRecoveryExample.swift`](Examples/StartupRecoveryExample.swift)
+demonstrates interrupted startup and resource reacquisition.
 
 ```sh
 swift test
 package_build_path="$(swift build --show-bin-path)"
-swiftc -swift-version 6 -typecheck -I "$package_build_path" -I "$package_build_path/Modules" Examples/AccountExample.swift
+swiftc -swift-version 6 -typecheck -I "$package_build_path" -I "$package_build_path/Modules" Examples/AccountExample.swift Examples/StartupRecoveryExample.swift
 ```
 
 Swift Testing covers deferred creation, configuration/startup order, retained
-model returns, teardown on first and return tasks, cancellation during startup,
+model returns, teardown on first and return tasks, cancelled/failed startup
+recovery, explicit retry, finite return overrides, cancellation during return,
 empty subscriptions, focus serialization/cancellation, concurrent subscribers,
 ordered reactions, fresh streams, and producer termination.
 

@@ -11,10 +11,11 @@ public protocol ScreenView: View {
 ///
 /// Keep `init()` free of startup work. Async hooks and subscribers must cooperate
 /// with cancellation. A retained model can be used again after `teardown()`.
+/// Startup may be retried after cancellation or failure; tolerate partial work.
 @MainActor
 public protocol ScreenViewModel: AnyObject, Sendable {
     init()
-    func onStartup() async
+    func onStartup() async throws
     func onFirstFocus() async
     func onLostFocus() async
     func onRegainedFocus() async
@@ -24,14 +25,14 @@ public protocol ScreenViewModel: AnyObject, Sendable {
 }
 
 public extension ScreenViewModel {
-    func onStartup() async {}
+    func onStartup() async throws {}
     func onFirstFocus() async {}
     func onLostFocus() async {}
     func onRegainedFocus() async { await onFirstFocus() }
 
-    /// Restarts subscribers when SwiftUI restarts a retained destination's task.
-    /// An override should call `await runSubscribers()` after its finite work.
-    func onReturn() async { await runSubscribers() }
+    /// Performs finite work when a successfully started model's task restarts.
+    /// Screen restarts subscribers after this returns; do not run them here.
+    func onReturn() async {}
     func subscriptions() -> ScreenSubscribers { ScreenSubscribers {} }
     func teardown() {}
 
@@ -59,14 +60,20 @@ where Content.ViewModel == ViewModel {
     }
 
     public var body: some View {
-        Group {
-            if let model = lifecycle.model {
+        // Keep task ownership stable when loading, content, and failure views change.
+        ZStack {
+            if lifecycle.startupError != nil {
+                VStack {
+                    Text("Unable to load this screen.")
+                    Button("Retry") { lifecycle.retryStartup() }
+                }
+            } else if let model = lifecycle.model {
                 Content(viewModel: model)
             } else {
                 ProgressView()
             }
         }
-        .task {
+        .task(id: lifecycle.startupAttempt) {
             await lifecycle.run(phase: scenePhase, configure: configure)
         }
         .onChange(of: scenePhase) { _, phase in
